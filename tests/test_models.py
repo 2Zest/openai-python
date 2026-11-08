@@ -915,6 +915,31 @@ def test_discriminated_unions_invalid_data_uses_cache() -> None:
     assert DISCRIMINATOR_CACHE.get(UnionType) is discriminator
 
 
+def test_discriminated_unions_build_deferred_variants_before_caching() -> None:
+    class A(BaseModel):
+        type: Literal["a"]
+
+        data: str
+
+    class B(BaseModel):
+        type: Literal["b"]
+
+        data: int
+
+    UnionType = cast(Any, Union[A, B])
+    assert not getattr(A, "__pydantic_complete__", True)
+    assert not getattr(B, "__pydantic_complete__", True)
+
+    result = construct_type(
+        value={"type": "b", "data": "not-an-int"},
+        type_=cast(Any, Annotated[Union[A, B], PropertyInfo(discriminator="type")]),
+    )
+
+    assert isinstance(result, B)
+    assert result.type == "b"
+    assert DISCRIMINATOR_CACHE.get(UnionType) is not None
+
+
 @pytest.mark.skipif(PYDANTIC_V1, reason="TypeAliasType is not supported in Pydantic v1")
 def test_type_alias_type() -> None:
     Alias = TypeAliasType("Alias", str)

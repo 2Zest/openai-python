@@ -19,6 +19,7 @@ from typing import (
     cast,
 )
 from datetime import date, datetime
+from threading import Lock
 from typing_extensions import (
     List,
     Unpack,
@@ -735,6 +736,7 @@ class CachedDiscriminatorType(Protocol):
 
 
 DISCRIMINATOR_CACHE: weakref.WeakKeyDictionary[type, DiscriminatorDetails] = weakref.WeakKeyDictionary()
+_DISCRIMINATOR_LOCK = Lock()
 
 
 class DiscriminatorDetails:
@@ -779,71 +781,76 @@ class DiscriminatorDetails:
 
 
 def _build_discriminated_union_meta(*, union: type, meta_annotations: tuple[Any, ...]) -> DiscriminatorDetails | None:
-    try:
-        cached = DISCRIMINATOR_CACHE.get(union)
-    except TypeError:
-        # PEP 604 unions cannot be weakly referenced on Python < 3.14.
-        cached = None
-    if cached is not None:
-        return cached
+    with _DISCRIMINATOR_LOCK:
+        try:
+            cached = DISCRIMINATOR_CACHE.get(union)
+        except TypeError:
+            # PEP 604 unions cannot be weakly referenced on Python < 3.14.
+            cached = None
+        if cached is not None:
+            return cached
 
-    discriminator_field_name: str | None = None
+        discriminator_field_name: str | None = None
 
-    for annotation in meta_annotations:
-        if isinstance(annotation, PropertyInfo) and annotation.discriminator is not None:
-            discriminator_field_name = annotation.discriminator
-            break
+        for annotation in meta_annotations:
+            if isinstance(annotation, PropertyInfo) and annotation.discriminator is not None:
+                discriminator_field_name = annotation.discriminator
+                break
 
-    if not discriminator_field_name:
-        return None
+        if not discriminator_field_name:
+            return None
 
-    mapping: dict[str, type] = {}
-    discriminator_alias: str | None = None
+        mapping: dict[str, type] = {}
+        discriminator_alias: str | None = None
 
-    for variant in get_args(union):
-        variant = strip_annotated_type(variant)
-        if is_basemodel_type(variant):
-            if PYDANTIC_V1:
-                field_info = variant.__fields__.get(discriminator_field_name)
-                if not field_info:
-                    continue
+        for variant in get_args(union):
+            variant = strip_annotated_type(variant)
+            if is_basemodel_type(variant):
+                if PYDANTIC_V1:
+                    field_info = variant.__fields__.get(discriminator_field_name)
+                    if not field_info:
+                        continue
 
-                # Note: if one variant defines an alias then they all should
-                discriminator_alias = field_info.alias
+                    # Note: if one variant defines an alias then they all should
+                    discriminator_alias = field_info.alias
 
-                if (annotation := getattr(field_info, "annotation", None)) and is_literal_type(annotation):
-                    for entry in get_args(annotation):
-                        if isinstance(entry, str):
-                            mapping[entry] = variant
-            else:
-                field = _extract_field_schema_pv2(variant, discriminator_field_name)
-                if not field:
-                    continue
+                    if (annotation := getattr(field_info, "annotation", None)) and is_literal_type(annotation):
+                        for entry in get_args(annotation):
+                            if isinstance(entry, str):
+                                mapping[entry] = variant
+                else:
+                    # Models in this SDK use deferred Pydantic builds. Rebuild each variant while holding the
+                    # discriminator lock, otherwise another thread can observe an incomplete core schema and
+                    # publish a partial mapping to the cache.
+                    cast(Any, variant).model_rebuild()
+                    field = _extract_field_schema_pv2(variant, discriminator_field_name)
+                    if not field:
+                        continue
 
-                # Note: if one variant defines an alias then they all should
-                discriminator_alias = field.get("serialization_alias")
+                    # Note: if one variant defines an alias then they all should
+                    discriminator_alias = field.get("serialization_alias")
 
-                field_schema = field["schema"]
+                    field_schema = field["schema"]
 
-                if field_schema["type"] == "literal":
-                    for entry in field_schema["expected"]:
-                        if isinstance(entry, str):
-                            mapping[entry] = variant
+                    if field_schema["type"] == "literal":
+                        for entry in field_schema["expected"]:
+                            if isinstance(entry, str):
+                                mapping[entry] = variant
 
-    if not mapping:
-        return None
+        if not mapping:
+            return None
 
-    details = DiscriminatorDetails(
-        mapping=mapping,
-        discriminator_field=discriminator_field_name,
-        discriminator_alias=discriminator_alias,
-    )
-    try:
-        DISCRIMINATOR_CACHE.setdefault(union, details)
-    except TypeError:
-        # Caching is optional; still return the discriminator for unsupported keys.
-        pass
-    return details
+        details = DiscriminatorDetails(
+            mapping=mapping,
+            discriminator_field=discriminator_field_name,
+            discriminator_alias=discriminator_alias,
+        )
+        try:
+            DISCRIMINATOR_CACHE.setdefault(union, details)
+        except TypeError:
+            # Caching is optional; still return the discriminator for unsupported keys.
+            pass
+        return details
 
 
 def _extract_field_schema_pv2(model: type[BaseModel], field_name: str) -> ModelField | None:
